@@ -1,5 +1,7 @@
 # Glass Memo
 
+<img src="assets/GlassMemo.png" alt="Glass Memo icon" width="160">
+
 macOSのデスクトップに半透明のメモを最前面表示する、Swift / AppKit製の常駐アプリです。
 
 ## 操作

@@ -1,8 +1,9 @@
 #!/bin/zsh
 set -eu
 cd "$(dirname "$0")"
-mkdir -p .build/ModuleCache build/GlassMemo.app/Contents/MacOS
+mkdir -p .build/ModuleCache build/GlassMemo.app/Contents/MacOS build/GlassMemo.app/Contents/Resources
 cp Info.plist build/GlassMemo.app/Contents/Info.plist
+cp assets/GlassMemo.icns build/GlassMemo.app/Contents/Resources/GlassMemo.icns
 export CLANG_MODULE_CACHE_PATH="$PWD/.build/ModuleCache"
 export SWIFT_MODULECACHE_PATH="$PWD/.build/ModuleCache"
 swiftc main.swift -o build/GlassMemo.app/Contents/MacOS/GlassMemo -framework Cocoa -framework Carbon -target arm64-apple-macosx13.0
