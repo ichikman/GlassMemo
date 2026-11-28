@@ -1,5 +1,25 @@
 import Cocoa
 import Carbon
+import Darwin
+
+final class InstanceLock {
+    private var descriptor: Int32 = -1
+    func acquire(at url: URL) throws -> Bool {
+        let fd = open(url.path, O_CREAT | O_RDWR | O_NOFOLLOW, S_IRUSR | S_IWUSR)
+        guard fd >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        if flock(fd, LOCK_EX | LOCK_NB) != 0 {
+            let code = errno
+            close(fd)
+            if code == EWOULDBLOCK { return false }
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(code))
+        }
+        descriptor = fd
+        return true
+    }
+    deinit { if descriptor >= 0 { close(descriptor) } }
+}
+
+let showMemoNotification = Notification.Name("app.glassmemo.desktop.show")
 
 final class MemoPanel: NSPanel {
     override var canBecomeKey: Bool { true }
@@ -14,7 +34,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
     var handler: EventHandlerRef?
     var editing = false
     var previousApp: NSRunningApplication?
-    let defaults = UserDefaults.standard
+    let defaults = CommandLine.arguments.contains("--smoke-test")
+        ? UserDefaults(suiteName: "app.glassmemo.test.\(UUID().uuidString)")!
+        : UserDefaults.standard
+    var visibilityItem: NSMenuItem!
     var backgroundOpacity: Double { defaults.object(forKey: "backgroundOpacity") as? Double ?? defaults.object(forKey: "opacity") as? Double ?? 0.38 }
     var textOpacity: Double { defaults.object(forKey: "textOpacity") as? Double ?? 0.9 }
     var opacityLabels: [Int: NSTextField] = [:]
@@ -23,8 +46,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
         NSApp.setActivationPolicy(.accessory)
         installMenu()
         let visible = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1200, height: 800)
-        panel = MemoPanel(contentRect: NSRect(x: visible.maxX - 380, y: visible.maxY - 340, width: 340, height: 280), styleMask: [.titled, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
-        panel.title = "Glass Memo · ⌥Mで編集"
+        panel = MemoPanel(contentRect: NSRect(x: visible.maxX - 380, y: visible.maxY - 340, width: 340, height: 280), styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
+        panel.title = "Glass Memo · ⌥M 表示／非表示"
         panel.titlebarAppearsTransparent = true
         panel.backgroundColor = NSColor(calibratedRed: 1, green: 0.97, blue: 0.82, alpha: 1)
         panel.isOpaque = false
@@ -35,6 +58,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
         panel.minSize = NSSize(width: 230, height: 150)
         panel.setFrameAutosaveName("MemoPosition")
         panel.delegate = self
+        let standbyButton = panel.standardWindowButton(.miniaturizeButton)
+        standbyButton?.target = self
+        standbyButton?.action = #selector(hideMemo)
+        standbyButton?.isEnabled = true
 
         let scroll = NSScrollView()
         scroll.translatesAutoresizingMaskIntoConstraints = false
@@ -54,7 +81,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
         editor.autoresizingMask = [.width]
         editor.textContainer?.widthTracksTextView = true
         editor.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-        editor.string = defaults.string(forKey: "memo") ?? "ここにメモを書けます。\n\n⌥M：編集を開始／終了\nEsc：編集を終了\n\n普段はクリックが背後のアプリに届きます。"
+        editor.string = defaults.string(forKey: "memo") ?? "ここにメモを書けます。\n\n⌥M：表示／非表示\nEsc：編集を終了\n赤いボタン：終了\n黄色いボタン：非表示（待機）\n\n普段はクリックが背後のアプリに届きます。"
         editor.delegate = self
         scroll.documentView = editor
         let content = panel.contentView!
@@ -66,9 +93,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
             scroll.bottomAnchor.constraint(equalTo: content.bottomAnchor)
         ])
         setEditing(false)
-        panel.orderFrontRegardless()
+        panel.orderOut(nil)
+        DistributedNotificationCenter.default().addObserver(self, selector: #selector(showMemo), name: showMemoNotification, object: nil)
         if CommandLine.arguments.contains("--smoke-test") {
-            setEditing(true)
+            precondition(!panel.isVisible)
+            toggleVisibility()
+            precondition(panel.isVisible && editing)
+            panel.standardWindowButton(.miniaturizeButton)?.performClick(nil)
+            precondition(!panel.isVisible && !editing && !panel.isMiniaturized)
+            showMemo()
             precondition(editing && !panel.ignoresMouseEvents && editor.isEditable)
             setEditing(false)
             precondition(!editing && panel.ignoresMouseEvents && !editor.isEditable)
@@ -76,6 +109,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
             let testFolder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             let testText = "日本語のメモ\n2行目 📝"
             do {
+                try FileManager.default.createDirectory(at: testFolder, withIntermediateDirectories: true)
+                let first = InstanceLock()
+                let second = InstanceLock()
+                let acquired = try first.acquire(at: testFolder.appendingPathComponent("instance.lock"))
+                let duplicate = try second.acquire(at: testFolder.appendingPathComponent("instance.lock"))
+                precondition(acquired && !duplicate)
                 let date = Date()
                 let url = try writeMemo(testText, to: testFolder, date: date)
                 let firstRead = try String(contentsOf: url, encoding: .utf8)
@@ -88,8 +127,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
                 try FileManager.default.removeItem(at: testFolder)
             } catch { fatalError("TXT save test failed: \(error)") }
             print("PASS: timestamped UTF-8 TXT, same-second collision, original preserved;")
-            print("PASS: edit / passive transitions, click-through, floating level")
-            NSApp.terminate(nil)
+            print("PASS: hidden startup, show/hide, editing, click-through, duplicate lock")
+            panel.performClose(nil)
             return
         }
         installHotKey()
@@ -99,7 +138,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
         let main = NSMenu()
         let appItem = NSMenuItem()
         let appMenu = NSMenu()
-        appMenu.addItem(withTitle: "終了", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appMenu.addItem(withTitle: "終了", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "")
         appItem.submenu = appMenu
         main.addItem(appItem)
         let fileItem = NSMenuItem(title: "ファイル", action: nil, keyEquivalent: "")
@@ -107,6 +146,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
         let saveItem = fileMenu.addItem(withTitle: "TXTを保存", action: #selector(saveText), keyEquivalent: "s")
         saveItem.keyEquivalentModifierMask = [.command]
         saveItem.target = self
+        let hide = fileMenu.addItem(withTitle: "メモを隠して待機", action: #selector(hideMemo), keyEquivalent: "")
+        hide.target = self
         fileItem.submenu = fileMenu
         main.addItem(fileItem)
         let editItem = NSMenuItem(title: "編集", action: nil, keyEquivalent: "")
@@ -120,8 +161,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
         status = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         status.button?.image = NSImage(systemSymbolName: "note.text", accessibilityDescription: "Glass Memo")
         let menu = NSMenu()
-        let toggle = menu.addItem(withTitle: "編集を切り替え（⌥M）", action: #selector(toggleEditing), keyEquivalent: "")
-        toggle.target = self
+        visibilityItem = menu.addItem(withTitle: "メモを表示（⌥M）", action: #selector(toggleVisibility), keyEquivalent: "")
+        visibilityItem.target = self
+        let edit = menu.addItem(withTitle: "メモを編集", action: #selector(showMemo), keyEquivalent: "")
+        edit.target = self
         let save = menu.addItem(withTitle: "TXTを保存（⌘S）", action: #selector(saveText), keyEquivalent: "")
         save.target = self
         menu.addItem(.separator())
@@ -146,7 +189,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
         let reset = menu.addItem(withTitle: "メモを画面中央に戻す", action: #selector(recenter), keyEquivalent: "")
         reset.target = self
         menu.addItem(.separator())
-        menu.addItem(withTitle: "Glass Memoを終了", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "")
+        let quit = menu.addItem(withTitle: "Glass Memoを終了", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "")
+        quit.target = NSApp
         status.menu = menu
     }
 
@@ -155,7 +199,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
         let result = InstallEventHandler(GetApplicationEventTarget(), { _, _, context in
             guard let context else { return OSStatus(eventNotHandledErr) }
             let delegate = Unmanaged<AppDelegate>.fromOpaque(context).takeUnretainedValue()
-            delegate.toggleEditing()
+            delegate.toggleVisibility()
             return noErr
         }, 1, &event, Unmanaged.passUnretained(self).toOpaque(), &handler)
         let registered = RegisterEventHotKey(UInt32(kVK_ANSI_M), UInt32(optionKey), EventHotKeyID(signature: 0x474D454D, id: 1), GetApplicationEventTarget(), 0, &hotKey)
@@ -202,7 +246,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
         }
     }
 
-    @objc func toggleEditing() { setEditing(!editing) }
+    @objc func toggleVisibility() {
+        if panel.isVisible { hideMemo() } else { showMemo() }
+    }
+    @objc func showMemo() {
+        guard panel != nil else { return }
+        visibilityItem.title = "メモを隠す（⌥M）"
+        setEditing(true)
+    }
+    @objc func hideMemo() {
+        setEditing(false)
+        panel.orderOut(nil)
+        visibilityItem.title = "メモを表示（⌥M）"
+    }
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        defaults.set(editor.string, forKey: "memo")
+        NSApp.terminate(nil)
+        return false
+    }
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showMemo()
+        return false
+    }
     func setEditing(_ value: Bool) {
         if value && !editing { previousApp = NSWorkspace.shared.frontmostApplication }
         editing = value
@@ -211,7 +277,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
         panel.hasShadow = value
         editor.isEditable = value
         editor.isSelectable = value
-        panel.title = value ? "編集中 · ⌘SでTXT保存 · Escで終了" : "Glass Memo · ⌥Mで編集"
+        panel.title = value ? "⌘S 保存 · 黄：待機 · 赤：終了" : "Glass Memo · ⌥M 表示／非表示"
         if value {
             NSApp.activate(ignoringOtherApps: true)
             panel.makeKeyAndOrderFront(nil)
@@ -245,14 +311,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
         opacityLabels[sender.tag]?.stringValue = "\(title)  \(Int(value))%"
         applyAppearance()
     }
-    @objc func recenter() { panel.center(); panel.orderFrontRegardless() }
+    @objc func recenter() { panel.center(); showMemo() }
     func applicationWillTerminate(_ notification: Notification) {
-        defaults.set(editor.string, forKey: "memo")
+        if let editor { defaults.set(editor.string, forKey: "memo") }
+        if CommandLine.arguments.contains("--smoke-test") { print("PASS: red close button terminates and saves draft") }
+        DistributedNotificationCenter.default().removeObserver(self)
         if let hotKey { UnregisterEventHotKey(hotKey) }
         if let handler { RemoveEventHandler(handler) }
     }
 }
 
+let instanceLock = InstanceLock()
+if !CommandLine.arguments.contains("--smoke-test") {
+    do {
+        let directory = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true).appendingPathComponent("GlassMemo", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        guard try instanceLock.acquire(at: directory.appendingPathComponent("instance.lock")) else {
+            DistributedNotificationCenter.default().postNotificationName(showMemoNotification, object: nil, userInfo: nil, deliverImmediately: true)
+            print("Glass Memo is already running; showing the existing memo.")
+            exit(0)
+        }
+    } catch {
+        fputs("Glass Memo could not acquire its instance lock: \(error.localizedDescription)\n", stderr)
+        exit(1)
+    }
+}
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
